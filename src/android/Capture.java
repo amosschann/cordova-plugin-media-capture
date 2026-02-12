@@ -19,9 +19,7 @@
 package org.apache.cordova.mediacapture;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -303,11 +301,9 @@ public class Capture extends CordovaPlugin {
 
     /**
      * Sets up an intent to capture images.  Result handled by onActivityResult()
-     * Note: We do not require READ_MEDIA_IMAGES for capture - that permission is for reading
-     * existing images; we write to app cache (getTempDirectoryPath()) for Google Play compliance.
      */
     private void captureImage(Request req) {
-        if (isMissingCameraPermissions(req, null)) return;
+        // if (isMissingCameraPermissions(req, Manifest.permission.READ_MEDIA_IMAGES)) return;
 
         // Save the number of images currently on disk for later
         this.numPics = queryImgDB(whichContentStore()).getCount();
@@ -332,23 +328,26 @@ public class Capture extends CordovaPlugin {
 
     /**
      * Sets up an intent to capture video.  Result handled by onActivityResult()
-     * Note: We do not require READ_MEDIA_VIDEO for capture - that permission is for reading
-     * existing videos; we write to app cache for Google Play compliance.
-     * We do NOT pass EXTRA_OUTPUT: some device/emulator Camera apps (e.g. com.android.camera2)
-     * crash in saveVideo() when given a FileProvider URI. Instead we let the camera save to
-     * its default location and copy the returned content URI to our cache in onVideoActivityResult.
      */
     private void captureVideo(Request req) {
-        if (isMissingCameraPermissions(req, null)) return;
+        if (isMissingCameraPermissions(req, Manifest.permission.READ_MEDIA_VIDEO)) return;
 
         Intent intent = new Intent(android.provider.MediaStore.ACTION_VIDEO_CAPTURE);
-        this.videoAbsolutePath = null; // will be set from intent.getData() in onVideoActivityResult
+        String timeStamp = new SimpleDateFormat("yyyyMMddHHmmssSSS").format(new Date());
+        String fileName = "cdv_media_capture_video_" + timeStamp + ".mp4";
+        File movie = new File(getTempDirectoryPath(), fileName);
 
-        if (Build.VERSION.SDK_INT > 7) {
+        Uri videoUri = FileProvider.getUriForFile(this.cordova.getActivity(),
+                this.applicationId + ".cordova.plugin.mediacapture.provider",
+                movie);
+        this.videoAbsolutePath = movie.getAbsolutePath();
+        intent.putExtra(android.provider.MediaStore.EXTRA_OUTPUT, videoUri);
+        LOG.d(LOG_TAG, "Recording a video and saving to: " + this.videoAbsolutePath);
+
+        if(Build.VERSION.SDK_INT > 7){
             intent.putExtra("android.intent.extra.durationLimit", req.duration);
             intent.putExtra("android.intent.extra.videoQuality", req.quality);
         }
-        LOG.d(LOG_TAG, "Starting video capture (no EXTRA_OUTPUT to avoid camera app crashes)");
         this.cordova.startActivityForResult((CordovaPlugin) this, intent, req.requestCode);
     }
 
@@ -366,7 +365,6 @@ public class Capture extends CordovaPlugin {
 
         // Result received okay
         if (resultCode == Activity.RESULT_OK) {
-            final Intent resultIntent = intent;
             Runnable processActivityResult = new Runnable() {
                 @Override
                 public void run() {
@@ -378,7 +376,7 @@ public class Capture extends CordovaPlugin {
                             onImageActivityResult(req);
                             break;
                         case CAPTURE_VIDEO:
-                            onVideoActivityResult(req, resultIntent);
+                            onVideoActivityResult(req);
                             break;
                     }
                 }
@@ -451,25 +449,8 @@ public class Capture extends CordovaPlugin {
         }
     }
 
-    public void onVideoActivityResult(Request req, Intent intent) {
-        // Video was saved by camera to its default location; get URI from result and copy to our cache
-        if (intent == null || intent.getData() == null) {
-            pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "No video data returned from camera."));
-            return;
-        }
-        Uri videoUri = intent.getData();
-        String timeStamp = new SimpleDateFormat("yyyyMMddHHmmssSSS").format(new Date());
-        String fileName = "cdv_media_capture_video_" + timeStamp + ".mp4";
-        File destFile = new File(getTempDirectoryPath(), fileName);
-        try {
-            copyUriToFile(videoUri, destFile);
-            this.videoAbsolutePath = destFile.getAbsolutePath();
-        } catch (IOException e) {
-            LOG.e(LOG_TAG, "Failed to copy video from camera result", e);
-            pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "Failed to save video: " + e.getMessage()));
-            return;
-        }
-
+    public void onVideoActivityResult(Request req) {
+        // create a file object from the video absolute path
         JSONObject mediaFile = createMediaFileWithAbsolutePath(this.videoAbsolutePath);
         if (mediaFile == null) {
             pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "Error: no mediaFile created from " + this.videoAbsolutePath));
@@ -479,27 +460,11 @@ public class Capture extends CordovaPlugin {
         req.results.put(mediaFile);
 
         if (req.results.length() >= req.limit) {
+            // Send Uri back to JavaScript for viewing video
             pendingRequests.resolveWithSuccess(req);
         } else {
+            // still need to capture more video clips
             captureVideo(req);
-        }
-    }
-
-    /**
-     * Copy content from a content URI to a local file (e.g. camera result to app cache).
-     */
-    private void copyUriToFile(Uri uri, File destFile) throws IOException {
-        ContentResolver resolver = this.cordova.getActivity().getContentResolver();
-        try (InputStream in = resolver.openInputStream(uri);
-             FileOutputStream out = new FileOutputStream(destFile)) {
-            if (in == null) {
-                throw new IOException("Could not open stream for " + uri);
-            }
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = in.read(buf)) > 0) {
-                out.write(buf, 0, len);
-            }
         }
     }
 
