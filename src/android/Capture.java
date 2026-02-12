@@ -19,7 +19,9 @@
 package org.apache.cordova.mediacapture;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -301,9 +303,11 @@ public class Capture extends CordovaPlugin {
 
     /**
      * Sets up an intent to capture images.  Result handled by onActivityResult()
+     * Note: We do not require READ_MEDIA_IMAGES for capture - that permission is for reading
+     * existing images; we write to app cache (getTempDirectoryPath()) for Google Play compliance.
      */
     private void captureImage(Request req) {
-        // if (isMissingCameraPermissions(req, Manifest.permission.READ_MEDIA_IMAGES)) return;
+        if (isMissingCameraPermissions(req, null)) return;
 
         // Save the number of images currently on disk for later
         this.numPics = queryImgDB(whichContentStore()).getCount();
@@ -328,6 +332,9 @@ public class Capture extends CordovaPlugin {
 
     /**
      * Sets up an intent to capture video.  Result handled by onActivityResult()
+     * READ_MEDIA_VIDEO is required on API 33+ for record/preview/upload (justified in Play Console).
+     * We pass EXTRA_OUTPUT so the camera has a valid file descriptor (required on some devices/emulators).
+     * If the camera app crashes after writing (e.g. in saveVideo()), we still use the file when RESULT_CANCELED.
      */
     private void captureVideo(Request req) {
         if (isMissingCameraPermissions(req, Manifest.permission.READ_MEDIA_VIDEO)) return;
@@ -344,7 +351,7 @@ public class Capture extends CordovaPlugin {
         intent.putExtra(android.provider.MediaStore.EXTRA_OUTPUT, videoUri);
         LOG.d(LOG_TAG, "Recording a video and saving to: " + this.videoAbsolutePath);
 
-        if(Build.VERSION.SDK_INT > 7){
+        if (Build.VERSION.SDK_INT > 7) {
             intent.putExtra("android.intent.extra.durationLimit", req.duration);
             intent.putExtra("android.intent.extra.videoQuality", req.quality);
         }
@@ -365,6 +372,7 @@ public class Capture extends CordovaPlugin {
 
         // Result received okay
         if (resultCode == Activity.RESULT_OK) {
+            final Intent resultIntent = intent;
             Runnable processActivityResult = new Runnable() {
                 @Override
                 public void run() {
@@ -376,7 +384,7 @@ public class Capture extends CordovaPlugin {
                             onImageActivityResult(req);
                             break;
                         case CAPTURE_VIDEO:
-                            onVideoActivityResult(req);
+                            onVideoActivityResult(req, resultIntent);
                             break;
                     }
                 }
@@ -390,7 +398,21 @@ public class Capture extends CordovaPlugin {
             if (req.results.length() > 0) {
                 pendingRequests.resolveWithSuccess(req);
             }
-            // user canceled the action
+            // For video: camera app may have crashed after writing to EXTRA_OUTPUT file; use it if present
+            else if (req.action == CAPTURE_VIDEO && this.videoAbsolutePath != null) {
+                final Request videoReq = req;
+                this.cordova.getThreadPool().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        File f = new File(videoAbsolutePath);
+                        if (f.exists() && f.length() > 0) {
+                            onVideoActivityResult(videoReq, null);
+                        } else {
+                            pendingRequests.resolveWithFailure(videoReq, createErrorObject(CAPTURE_NO_MEDIA_FILES, "Canceled."));
+                        }
+                    }
+                });
+            }
             else {
                 pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_NO_MEDIA_FILES, "Canceled."));
             }
@@ -449,8 +471,42 @@ public class Capture extends CordovaPlugin {
         }
     }
 
-    public void onVideoActivityResult(Request req) {
-        // create a file object from the video absolute path
+    public void onVideoActivityResult(Request req, Intent intent) {
+        // Prefer file from EXTRA_OUTPUT if it exists and has content (camera wrote to our file)
+        if (this.videoAbsolutePath != null) {
+            File outputFile = new File(this.videoAbsolutePath);
+            if (outputFile.exists() && outputFile.length() > 0) {
+                JSONObject mediaFile = createMediaFileWithAbsolutePath(this.videoAbsolutePath);
+                if (mediaFile != null) {
+                    req.results.put(mediaFile);
+                    if (req.results.length() >= req.limit) {
+                        pendingRequests.resolveWithSuccess(req);
+                    } else {
+                        captureVideo(req);
+                    }
+                    return;
+                }
+            }
+        }
+        // Fallback: camera returned a content URI (no EXTRA_OUTPUT or camera used its own path)
+        if (intent != null && intent.getData() != null) {
+            Uri videoUri = intent.getData();
+            String timeStamp = new SimpleDateFormat("yyyyMMddHHmmssSSS").format(new Date());
+            String fileName = "cdv_media_capture_video_" + timeStamp + ".mp4";
+            File destFile = new File(getTempDirectoryPath(), fileName);
+            try {
+                copyUriToFile(videoUri, destFile);
+                this.videoAbsolutePath = destFile.getAbsolutePath();
+            } catch (IOException e) {
+                LOG.e(LOG_TAG, "Failed to copy video from camera result", e);
+                pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "Failed to save video: " + e.getMessage()));
+                return;
+            }
+        } else {
+            pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "No video data returned from camera."));
+            return;
+        }
+
         JSONObject mediaFile = createMediaFileWithAbsolutePath(this.videoAbsolutePath);
         if (mediaFile == null) {
             pendingRequests.resolveWithFailure(req, createErrorObject(CAPTURE_INTERNAL_ERR, "Error: no mediaFile created from " + this.videoAbsolutePath));
@@ -460,11 +516,27 @@ public class Capture extends CordovaPlugin {
         req.results.put(mediaFile);
 
         if (req.results.length() >= req.limit) {
-            // Send Uri back to JavaScript for viewing video
             pendingRequests.resolveWithSuccess(req);
         } else {
-            // still need to capture more video clips
             captureVideo(req);
+        }
+    }
+
+    /**
+     * Copy content from a content URI to a local file (e.g. camera result to app cache).
+     */
+    private void copyUriToFile(Uri uri, File destFile) throws IOException {
+        ContentResolver resolver = this.cordova.getActivity().getContentResolver();
+        try (InputStream in = resolver.openInputStream(uri);
+             FileOutputStream out = new FileOutputStream(destFile)) {
+            if (in == null) {
+                throw new IOException("Could not open stream for " + uri);
+            }
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) > 0) {
+                out.write(buf, 0, len);
+            }
         }
     }
 
